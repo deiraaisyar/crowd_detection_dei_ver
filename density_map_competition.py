@@ -21,7 +21,7 @@ def generate_density_maps_competition(dataset_root):
     train_labels_path = os.path.join(dataset_root, 'train', 'labels')
     
     # Create output directory for processed data
-    output_path = os.path.join(dataset_root, 'train', 'new_data')
+    output_path = '/kaggle/working/train/new_data'
     os.makedirs(output_path, exist_ok=True)
     
     # Get all image files
