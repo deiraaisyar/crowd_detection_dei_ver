@@ -28,7 +28,7 @@ class DatasetCompetition(data.Dataset):
         if is_train:
             # Training data - load images and corresponding .h5 files
             images_path = os.path.join(data_path, 'train', 'images')
-            labels_path = os.path.join(data_path, 'train', 'new_data')
+            labels_path = '/kaggle/working/train/new_data'
             
             self.image_list = glob.glob(os.path.join(images_path, '*.jpg'))
             self.label_list = []
@@ -59,7 +59,7 @@ class DatasetCompetition(data.Dataset):
             else:
                 # Validation split from training data
                 images_path = os.path.join(data_path, 'train', 'images')
-                labels_path = os.path.join(data_path, 'train', 'new_data')
+                labels_path = '/kaggle/working/train/new_data'
                 
                 all_images = glob.glob(os.path.join(images_path, '*.jpg'))
                 all_images.sort()
