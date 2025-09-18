@@ -1,329 +1,208 @@
-import numpy as np
 import torch
+from torch import nn
 from torch import optim
-from torch.autograd import Variable
-from torch.optim.lr_scheduler import StepLR
-import torch.nn.functional as F
-from model.locator import Crowd_locator
-from config import cfg
-from misc.utils import *
-import datasets
-import cv2
-from tqdm import tqdm
-from misc.compute_metric import eval_metrics
+from torch.utils import data
+from dataset_competition import DatasetCompetition
+from models import Model
+from tensorboardX import SummaryWriter
 import os
+import argparse
 import time
 
-class Trainer():
-    def __init__(self, cfg_data, pwd):
-        self.cfg_data = cfg_data
-        self.train_loader, self.val_loader, self.restore_transform = datasets.loading_data(cfg.DATASET)
-
-        self.data_mode = cfg.DATASET
-        self.exp_name = cfg.EXP_NAME
-        self.exp_path = cfg.EXP_PATH
-        self.pwd = pwd
-
-        self.net_name = cfg.NET
-        self.net = Crowd_locator(cfg.NET, cfg.GPU_ID, pretrained=True)
-
-        if cfg.OPT == 'Adam':
-            self.optimizer = optim.Adam([{'params': self.net.Extractor.parameters(), 'lr': cfg.LR_BASE_NET, 'weight_decay': 1e-5},
-                                         {'params': self.net.Binar.parameters(), 'lr': cfg.LR_BM_NET}])
-
-        self.scheduler = StepLR(self.optimizer, step_size=cfg.NUM_EPOCH_LR_DECAY, gamma=cfg.LR_DECAY)
-        self.train_record = {'best_F1': 0, 'best_Pre': 0, 'best_Rec': 0,
-                             'best_mae': 1e20, 'best_mse': 1e20, 'best_nae': 1e20, 'best_model_name': ''}
-        # best_mae used for selecting best checkpoint (keeps behaviour similar to train_competition_2.py)
-        self.best_mae = self.train_record['best_mae']
-
-        self.timer = {'iter time': Timer(), 'train time': Timer(), 'val time': Timer()}
-
-        self.epoch = 0
-        self.i_tb = 0
-        self.num_iters = cfg.MAX_EPOCH * int(len(self.train_loader))
-
-        # resume handling
-        if cfg.RESUME:
-            latest_state = torch.load(cfg.RESUME_PATH)
-            self.net.load_state_dict(latest_state['net'])
-            self.optimizer.load_state_dict(latest_state['optimizer'])
-            self.scheduler.load_state_dict(latest_state['scheduler'])
-            self.epoch = latest_state['epoch'] + 1
-            self.i_tb = latest_state.get('i_tb', self.i_tb)
-            self.num_iters = latest_state.get('num_iters', self.num_iters)
-            self.train_record = latest_state.get('train_record', self.train_record)
-            self.exp_path = latest_state.get('exp_path', self.exp_path)
-            self.exp_name = latest_state.get('exp_name', self.exp_name)
-            self.best_mae = self.train_record.get('best_mae', self.best_mae)
-            print("Finish loading resume mode")
-
-        # create dirs if not exist
-        os.makedirs(self.exp_path, exist_ok=True)
-
-        self.writer, self.log_txt = logger(self.exp_path, self.exp_name, self.pwd, ['exp', 'figure', 'img', 'vis'], resume=cfg.RESUME)
-
-    def forward(self):
-        # main loop
-        for epoch in range(self.epoch, cfg.MAX_EPOCH):
-            self.epoch = epoch
-            # training
-            self.timer['train time'].tic()
-            self.train()
-            self.timer['train time'].toc(average=False)
-
-            print('train time: {:.2f}s'.format(self.timer['train time'].diff))
-            print('=' * 20)
-
-            # validation
-            if epoch % cfg.VAL_FREQ == 0 and epoch > cfg.VAL_DENSE_START:
-                self.timer['val time'].tic()
-                # run validate -> returns metrics dict so we can decide checkpoint saving
-                val_results = self.validate()
-                self.timer['val time'].toc(average=False)
-                print('val time: {:.2f}s'.format(self.timer['val time'].diff))
-
-                # save checkpoints similarly to train_competition_2.py
-                # build state
-                state = {
-                    'epoch': epoch,
-                    'net': self.net.state_dict(),
-                    'optimizer': self.optimizer.state_dict(),
-                    'scheduler': self.scheduler.state_dict(),
-                    'num_iters': self.num_iters,
-                    'i_tb': self.i_tb,
-                    'train_record': self.train_record,
-                    'exp_path': self.exp_path,
-                    'exp_name': self.exp_name,
-                    'best_mae': self.best_mae
-                }
-
-                latest_path = os.path.join(self.exp_path, 'checkpoint_latest.pth')
-                torch.save(state, latest_path)
-
-                mae = val_results.get('mae', None)
-                if mae is not None:
-                    # if improvement, save best
-                    if mae < self.best_mae:
-                        self.best_mae = mae
-                        self.train_record['best_mae'] = mae
-                        best_path = os.path.join(self.exp_path, 'checkpoint_best.pth')
-                        torch.save(state, best_path)
-                        print(f"New best model saved! MAE: {self.best_mae:.4f}")
-
-        # after all epochs complete, print summary and close writer
-        print("Training completed!")
-        print(f"Best MAE achieved: {self.best_mae:.4f}")
-        try:
-            self.writer.close()
-        except Exception:
-            pass
-
-    def train(self):  # training for all datasets
-        self.net.train()
-        for i, data in enumerate(self.train_loader, 0):
-            self.i_tb += 1
-            self.timer['iter time'].tic()
-            img, gt_map = data
-
-            img = Variable(img).cuda()
-            gt_map = Variable(gt_map).cuda()
-
-            self.optimizer.zero_grad()
-            threshold_matrix, pre_map, binar_map = self.net(img, gt_map)
-            head_map_loss, binar_map_loss = self.net.loss
-
-            all_loss = head_map_loss + binar_map_loss
-            all_loss.backward()
-            self.optimizer.step()
-
-            lr1, lr2 = adjust_learning_rate(self.optimizer,
-                                            cfg.LR_BASE_NET,
-                                            cfg.LR_BM_NET,
-                                            self.num_iters,
-                                            self.i_tb)
-
-            if (i + 1) % cfg.PRINT_FREQ == 0:
-                self.writer.add_scalar('train_lr1', lr1, self.i_tb)
-                self.writer.add_scalar('train_lr2', lr2, self.i_tb)
-                self.writer.add_scalar('train_loss', head_map_loss.item(), self.i_tb)
-                self.writer.add_scalar('Binar_loss', binar_map_loss.item(), self.i_tb)
-                if len(cfg.GPU_ID) > 1:
-                    self.writer.add_scalar('weight', self.net.Binar.module.weight.data.item(), self.i_tb)
-                    self.writer.add_scalar('bias', self.net.Binar.module.bias.data.item(), self.i_tb)
-                else:
-                    self.writer.add_scalar('weight', self.net.Binar.weight.data.item(), self.i_tb)
-                    self.writer.add_scalar('bias', self.net.Binar.bias.data.item(), self.i_tb)
-
-                self.timer['iter time'].toc(average=False)
-                print('[ep %d][it %d][loss %.4f][lr1 %.6f][lr2 %.6f][%.2fs]' %
-                      (self.epoch + 1, i + 1, head_map_loss.item(),
-                       self.optimizer.param_groups[0]['lr'], self.optimizer.param_groups[1]['lr'],
-                       self.timer['iter time'].diff))
-                print('       [t-max: %.3f t-min: %.3f]' %
-                      (threshold_matrix.max().item(), threshold_matrix.min().item()))
-            if i % 100 == 0:
-                box_pre, boxes = self.get_boxInfo_from_Binar_map(binar_map[0].detach().cpu().numpy())
-                vis_results('tmp_vis', 0, self.writer, self.restore_transform, img, pre_map[0].detach().cpu().numpy(),
-                            gt_map[0].detach().cpu().numpy(), binar_map.detach().cpu().numpy(),
-                            threshold_matrix.detach().cpu().numpy(), boxes)
-
-    def get_boxInfo_from_Binar_map(self, Binar_numpy, min_area=3):
-        Binar_numpy = Binar_numpy.squeeze().astype(np.uint8)
-        assert Binar_numpy.ndim == 2
-        cnt, labels, stats, centroids = cv2.connectedComponentsWithStats(Binar_numpy, connectivity=4)  # centriod (w,h)
-
-        boxes = stats[1:, :]
-        points = centroids[1:, :]
-        index = (boxes[:, 4] >= min_area)
-        boxes = boxes[index]
-        points = points[index]
-        pre_data = {'num': len(points), 'points': points}
-        return pre_data, boxes
-
-    def validate(self):
-        self.net.eval()
-        num_classes = 6
-        losses = AverageMeter()
-        cnt_errors = {'mae': AverageMeter(), 'mse': AverageMeter(), 'nae': AverageMeter()}
-        metrics_s = {'tp': AverageMeter(), 'fp': AverageMeter(), 'fn': AverageMeter(), 'tp_c': AverageCategoryMeter(num_classes),
-                     'fn_c': AverageCategoryMeter(num_classes)}
-        metrics_l = {'tp': AverageMeter(), 'fp': AverageMeter(), 'fn': AverageMeter(), 'tp_c': AverageCategoryMeter(num_classes),
-                     'fn_c': AverageCategoryMeter(num_classes)}
-
-        c_maes = {'level': AverageCategoryMeter(5), 'illum': AverageCategoryMeter(4)}
-        c_mses = {'level': AverageCategoryMeter(5), 'illum': AverageCategoryMeter(4)}
-        c_naes = {'level': AverageCategoryMeter(5), 'illum': AverageCategoryMeter(4)}
-        gen_tqdm = tqdm(self.val_loader)
-
-        for vi, data in enumerate(gen_tqdm, 0):
-            img, dot_map, gt_data = data
-            slice_h, slice_w = self.cfg_data.TRAIN_SIZE
-
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--bs', default=8, type=int, help='batch size')
+    parser.add_argument('--epoch', default=500, type=int, help='train epochs')
+    parser.add_argument('--data_path', default='./dataset', type=str, help='path to competition dataset')
+    parser.add_argument('--lr', default=1e-4, type=float, help='initial learning rate')
+    parser.add_argument('--load', default=False, action='store_true', help='load checkpoint')
+    parser.add_argument('--save_path', default='./checkpoints_competition', type=str, help='path to save checkpoint')
+    parser.add_argument('--gpu', default=0, type=int, help='gpu id')
+    parser.add_argument('--log_path', default='./logs_competition', type=str, help='path to log')
+    parser.add_argument('--val_freq', default=5, type=int, help='validation frequency (epochs)')
+    
+    args = parser.parse_args()
+    
+    # Create directories if they don't exist
+    os.makedirs(args.save_path, exist_ok=True)
+    os.makedirs(args.log_path, exist_ok=True)
+    
+    print("=== SFANet Competition Training ===")
+    print(f"Dataset path: {args.data_path}")
+    print(f"Batch size: {args.bs}")
+    print(f"Learning rate: {args.lr}")
+    print(f"Total epochs: {args.epoch}")
+    print(f"Save path: {args.save_path}")
+    
+    # Create datasets
+    print("\nLoading datasets...")
+    train_dataset = DatasetCompetition(args.data_path, is_train=True, is_test=False)
+    val_dataset = DatasetCompetition(args.data_path, is_train=False, is_test=False)
+    
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    # Create data loaders
+    train_loader = data.DataLoader(train_dataset, batch_size=args.bs, shuffle=True, 
+                                   num_workers=4, pin_memory=True)
+    val_loader = data.DataLoader(val_dataset, batch_size=1, shuffle=False, 
+                                 num_workers=2, pin_memory=True)
+    
+    # Setup device
+    device = torch.device('cuda:' + str(args.gpu))
+    print(f"Using device: {device}")
+    
+    # Create model
+    model = Model().to(device)
+    
+    # Setup logging
+    writer = SummaryWriter(args.log_path)
+    
+    # Loss functions (same as original)
+    mseloss = nn.MSELoss(reduction='sum').to(device)
+    bceloss = nn.BCELoss(reduction='sum').to(device)
+    
+    # Optimizer 
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Load checkpoint if requested
+    if args.load:
+        checkpoint_path = os.path.join(args.save_path, 'checkpoint_latest.pth')
+        if os.path.exists(checkpoint_path):
+            print(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path)
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            
+            best_mae = torch.load(os.path.join(args.save_path, 'checkpoint_best.pth'))['mae']
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"Resumed from epoch {start_epoch}, best MAE: {best_mae:.4f}")
+        else:
+            print(f"No checkpoint found at {checkpoint_path}, starting from scratch")
+            best_mae = 999999
+            start_epoch = 0
+    else:
+        best_mae = 999999
+        start_epoch = 0
+    
+    print(f"\nStarting training from epoch {start_epoch}")
+    print("=" * 60)
+    
+    # Training loop
+    for epoch in range(start_epoch, start_epoch + args.epoch):
+        epoch_start_time = time.time()
+        
+        # Training phase
+        model.train()
+        loss_avg = 0.0
+        loss_att_avg = 0.0
+        
+        for i, (images, density, att) in enumerate(train_loader):
+            images = images.to(device)
+            density = density.to(device)
+            att = att.to(device)
+            
+            # Forward pass
+            outputs, attention = model(images)
+            
+            # Calculate losses
+            loss_density = mseloss(outputs, density) / args.bs
+            loss_attention = bceloss(attention, att) / args.bs * 0.1  # Same weight as original
+            loss_total = loss_density + loss_attention
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss_total.backward()
+            optimizer.step()
+            
+            # Accumulate losses
+            loss_avg += loss_density.item()
+            loss_att_avg += loss_attention.item()
+            
+            # Print progress
+            if (i + 1) % 50 == 0:
+                avg_density_loss = loss_avg / (i + 1)
+                avg_att_loss = loss_att_avg / (i + 1)
+                pred_count = outputs.sum().item() / args.bs
+                true_count = density.sum().item() / args.bs
+                
+                print(f"Epoch {epoch:3d}, Step {i+1:4d}/{len(train_loader)}: "
+                      f"Loss_D={avg_density_loss:.4f}, Loss_A={avg_att_loss:.4f}, "
+                      f"Pred={pred_count:.1f}, True={true_count:.1f}")
+        
+        # Calculate epoch averages
+        epoch_loss_density = loss_avg / len(train_loader)
+        epoch_loss_att = loss_att_avg / len(train_loader)
+        epoch_time = time.time() - epoch_start_time
+        
+        # Log training metrics
+        writer.add_scalar('loss/train_loss_density', epoch_loss_density, epoch)
+        writer.add_scalar('loss/train_loss_attention', epoch_loss_att, epoch)
+        writer.add_scalar('loss/train_loss_total', epoch_loss_density + epoch_loss_att, epoch)
+        
+        print(f"Epoch {epoch} completed in {epoch_time:.1f}s - "
+              f"Avg Loss: {epoch_loss_density:.4f} + {epoch_loss_att:.4f} = {epoch_loss_density + epoch_loss_att:.4f}")
+        
+        # Validation phase
+        if (epoch + 1) % args.val_freq == 0:
+            print("Running validation...")
+            model.eval()
+            
             with torch.no_grad():
-                img = Variable(img).cuda()
-                dot_map = Variable(dot_map).cuda()
-                # cropping / tiling logic (kept as original)
-                crop_imgs, crop_gt, crop_masks = [], [], []
-                b, c, h, w = img.shape
+                mae = 0.0
+                mse = 0.0
+                val_count = 0
+                
+                for images, gt in val_loader:
+                    images = images.to(device)
+                    
+                    # Forward pass
+                    predict, _ = model(images)
+                    
+                    # Calculate metrics
+                    pred_count = predict.sum().item()
+                    true_count = gt.item()
+                    
+                    mae += abs(pred_count - true_count)
+                    mse += (pred_count - true_count) ** 2
+                    val_count += 1
+                    
+                    if val_count <= 5:  # Print first few predictions
+                        print(f"  Val sample {val_count}: Pred={pred_count:.1f}, True={true_count}")
+                
+                # Calculate final metrics
+                mae = mae / len(val_loader)
+                mse = (mse / len(val_loader)) ** 0.5
+                
+                print(f"Validation Results - MAE: {mae:.4f}, MSE: {mse:.4f}")
+                
+                # Log validation metrics
+                writer.add_scalar('eval/MAE', mae, epoch)
+                writer.add_scalar('eval/MSE', mse, epoch)
+        
+        # Save checkpoints
+        state = {
+            'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'mae': mae if (epoch + 1) % args.val_freq == 0 else best_mae,
+            'mse': mse if (epoch + 1) % args.val_freq == 0 else 0
+        }
+        
+        # Save latest checkpoint
+        torch.save(state, os.path.join(args.save_path, 'checkpoint_latest.pth'))
+        
+        # Save best checkpoint
+        if (epoch + 1) % args.val_freq == 0 and mae < best_mae:
+            best_mae = mae
+            torch.save(state, os.path.join(args.save_path, 'checkpoint_best.pth'))
+            print(f"New best model saved! MAE: {best_mae:.4f}")
+        
+        print("-" * 60)
+    
+    print("Training completed!")
+    print(f"Best MAE achieved: {best_mae:.4f}")
+    writer.close()
 
-                if h * w < slice_h * 2 * slice_w * 2 and h % 16 == 0 and w % 16 == 0:
-                    [pred_threshold, pred_map, __] = [i.cpu() for i in self.net(img, mask_gt=None, mode='val')]
-                else:
-                    if h % 16 != 0:
-                        pad_dims = (0, 0, 0, 16 - h % 16)
-                        h = (h // 16 + 1) * 16
-                        img = F.pad(img, pad_dims, "constant")
-                        dot_map = F.pad(dot_map, pad_dims, "constant")
-
-                    if w % 16 != 0:
-                        pad_dims = (0, 16 - w % 16, 0, 0)
-                        w = (w // 16 + 1) * 16
-                        img = F.pad(img, pad_dims, "constant")
-                        dot_map = F.pad(dot_map, pad_dims, "constant")
-
-                    assert img.size()[2:] == dot_map.size()[2:]
-
-                    for i in range(0, h, slice_h):
-                        h_start, h_end = max(min(h - slice_h, i), 0), min(h, i + slice_h)
-                        for j in range(0, w, slice_w):
-                            w_start, w_end = max(min(w - slice_w, j), 0), min(w, j + slice_w)
-                            crop_imgs.append(img[:, :, h_start:h_end, w_start:w_end])
-                            crop_gt.append(dot_map[:, :, h_start:h_end, w_start:w_end])
-                            mask = torch.zeros_like(dot_map).cpu()
-                            mask[:, :, h_start:h_end, w_start:w_end].fill_(1.0)
-                            crop_masks.append(mask)
-                    crop_imgs, crop_gt, crop_masks = map(lambda x: torch.cat(x, dim=0), (crop_imgs, crop_gt, crop_masks))
-
-                    crop_preds, crop_thresholds = [], []
-                    nz, period = crop_imgs.size(0), self.cfg_data.TRAIN_BATCH_SIZE
-                    for i in range(0, nz, period):
-                        [crop_threshold, crop_pred, __] = [i.cpu() for i in self.net(crop_imgs[i:min(nz, i + period)], mask_gt=None, mode='val')]
-                        crop_preds.append(crop_pred)
-                        crop_thresholds.append(crop_threshold)
-
-                    crop_preds = torch.cat(crop_preds, dim=0)
-                    crop_thresholds = torch.cat(crop_thresholds, dim=0)
-
-                    idx = 0
-                    pred_map = torch.zeros_like(dot_map).cpu().float()
-                    pred_threshold = torch.zeros_like(dot_map).cpu().float()
-                    for i in range(0, h, slice_h):
-                        h_start, h_end = max(min(h - slice_h, i), 0), min(h, i + slice_h)
-                        for j in range(0, w, slice_w):
-                            w_start, w_end = max(min(w - slice_w, j), 0), min(w, j + slice_w)
-                            pred_map[:, :, h_start:h_end, w_start:w_end] += crop_preds[idx]
-                            pred_threshold[:, :, h_start:h_end, w_start:w_end] += crop_thresholds[idx]
-                            idx += 1
-
-                    mask = crop_masks.sum(dim=0)
-                    pred_map = (pred_map / mask)
-                    pred_threshold = (pred_threshold / mask)
-
-                a = torch.ones_like(pred_map)
-                b = torch.zeros_like(pred_map)
-                binar_map = torch.where(pred_map >= pred_threshold, a, b)
-
-                dot_map = dot_map.cpu()
-                loss = F.mse_loss(pred_map, dot_map)
-
-                losses.update(loss.item())
-                binar_map = binar_map.numpy()
-                pred_data, boxes = self.get_boxInfo_from_Binar_map(binar_map)
-
-                tp_s, fp_s, fn_s, tp_c_s, fn_c_s, tp_l, fp_l, fn_l, tp_c_l, fn_c_l = eval_metrics(num_classes, pred_data, gt_data)
-
-                metrics_s['tp'].update(tp_s)
-                metrics_s['fp'].update(fp_s)
-                metrics_s['fn'].update(fn_s)
-                metrics_s['tp_c'].update(tp_c_s)
-                metrics_s['fn_c'].update(fn_c_s)
-                metrics_l['tp'].update(tp_l)
-                metrics_l['fp'].update(fp_l)
-                metrics_l['fn'].update(fn_l)
-                metrics_l['tp_c'].update(tp_c_l)
-                metrics_l['fn_c'].update(fn_c_l)
-
-                gt_count, pred_cnt = gt_data['num'].numpy().astype(float), pred_data['num']
-                s_mae = abs(gt_count - pred_cnt)
-                s_mse = ((gt_count - pred_cnt) * (gt_count - pred_cnt))
-                cnt_errors['mae'].update(s_mae)
-                cnt_errors['mse'].update(s_mse)
-                if gt_count != 0:
-                    s_nae = (abs(gt_count - pred_cnt) / gt_count)
-                    cnt_errors['nae'].update(s_nae)
-
-                if vi == 0:
-                    vis_results(self.exp_name, self.epoch, self.writer, self.restore_transform, img,
-                                pred_map.numpy(), dot_map.numpy(), binar_map,
-                                pred_threshold.numpy(), boxes)
-
-        ap_s = metrics_s['tp'].sum / (metrics_s['tp'].sum + metrics_s['fp'].sum + 1e-20)
-        ar_s = metrics_s['tp'].sum / (metrics_s['tp'].sum + metrics_s['fn'].sum + 1e-20)
-        f1m_s = 2 * ap_s * ar_s / (ap_s + ar_s + 1e-20)
-        ar_c_s = metrics_s['tp_c'].sum / (metrics_s['tp_c'].sum + metrics_s['fn_c'].sum + 1e-20)
-
-        ap_l = metrics_l['tp'].sum / (metrics_l['tp'].sum + metrics_l['fp'].sum + 1e-20)
-        ar_l = metrics_l['tp'].sum / (metrics_l['tp'].sum + metrics_l['fn'].sum + 1e-20)
-        f1m_l = 2 * ap_l * ar_l / (ap_l + ar_l + 1e-20)
-        ar_c_l = metrics_l['tp_c'].sum / (metrics_l['tp_c'].sum + metrics_l['fn_c'].sum + 1e-20)
-
-        loss = losses.avg
-        mae = cnt_errors['mae'].avg
-        mse = np.sqrt(cnt_errors['mse'].avg)
-        nae = cnt_errors['nae'].avg
-
-        self.writer.add_scalar('val_loss', loss, self.epoch + 1)
-        self.writer.add_scalar('F1', f1m_l, self.epoch + 1)
-        self.writer.add_scalar('Pre', ap_l, self.epoch + 1)
-        self.writer.add_scalar('Rec', ar_l, self.epoch + 1)
-        self.writer.add_scalar('overall_mae', mae, self.epoch + 1)
-        self.writer.add_scalar('overall_mse', mse, self.epoch + 1)
-        self.writer.add_scalar('overall_nae', nae, self.epoch + 1)
-
-        self.train_record = update_model(self, [f1m_l, ap_l, ar_l, mae, mse, nae, loss])
-
-        print_NWPU_summary(self, [f1m_l, ap_l, ar_l, mae, mse, nae, loss])
-
-        # return a dict of validation metrics so caller can decide checkpoint saving
-        return {'mae': mae, 'mse': mse, 'nae': nae, 'loss': loss, 'f1': f1m_l}
+if __name__ == '__main__':
+    main()

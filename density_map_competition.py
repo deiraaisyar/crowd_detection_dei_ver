@@ -84,31 +84,46 @@ def generate_density_maps_competition(dataset_root):
                     invalid_points += 1
                     print(f"  Out-of-bounds coordinate in {img_name}: ({x}, {y}) -> ({x_int}, {y_int}), image size: {width}x{height}")
             
+
             # Apply Gaussian filter (same as original - sigma=5)
             density_map = gaussian_filter(density_map, 5)
-            
+
             # Generate attention map (same threshold as original)
             attention_map = (density_map > 0.001).astype(np.float32)
-            
+
             # Verify count consistency
             actual_count = valid_points
             if actual_count != human_num_label:
                 print(f"  Count mismatch in {img_name}: JSON says {human_num_label}, found {actual_count} valid points")
-            
+
+            # Optionally, calculate Euclidean loss if ground truth map is available
+            # Here, we use the original point map (before Gaussian) as a pseudo ground truth
+            gt_map = np.zeros((height, width), dtype=np.float32)
+            for point in points:
+                if isinstance(point, dict):
+                    x, y = point.get('x', 0), point.get('y', 0)
+                else:
+                    x, y = point[0], point[1]
+                x_int = int(round(x))
+                y_int = int(round(y))
+                if 0 <= y_int < height and 0 <= x_int < width:
+                    gt_map[y_int, x_int] = 1.0
+            euclidean_loss = np.sqrt(np.sum((density_map - gt_map) ** 2))
+
             # Save as .h5 file (compatible with existing dataset.py)
             h5_filename = img_name.replace('.jpg', '.h5')
             h5_path = os.path.join(output_path, h5_filename)
-            
+
             with h5py.File(h5_path, 'w') as hf:
                 hf['density'] = density_map
                 hf['attention'] = attention_map
                 hf['gt'] = actual_count  # Use actual valid points count
-            
+
             processed_count += 1
-            
+
             if processed_count % 100 == 0:
                 print(f"Processed {processed_count}/{len(image_files)} images")
-                
+
             # Log statistics for first few images
             if processed_count <= 5:
                 print(f"Image {img_name}:")
@@ -116,6 +131,7 @@ def generate_density_maps_competition(dataset_root):
                 print(f"  Valid points: {valid_points}, Invalid: {invalid_points}")
                 print(f"  Density sum: {density_map.sum():.2f}")
                 print(f"  Attention pixels: {attention_map.sum()}")
+                print(f"  Euclidean loss: {euclidean_loss:.4f}")
                 
         except Exception as e:
             print(f"Error processing {img_path}: {str(e)}")
