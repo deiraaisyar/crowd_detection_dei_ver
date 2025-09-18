@@ -171,7 +171,7 @@ def visualize_sample_results(dataset_root, num_samples=3):
 
 if __name__ == '__main__':
     # Configuration
-    dataset_root = './datase'  # Adjust path as needed
+    dataset_root = '/kaggle/input/penyisihan-hology-8-0-2025-data-mining'  # Adjust path as needed
     
     print("Starting competition dataset preprocessing...")
     print("Converting JSON annotations to density maps...")
