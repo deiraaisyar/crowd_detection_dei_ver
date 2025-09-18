@@ -105,7 +105,7 @@ def test_dataset_structure():
     """Test dataset structure"""
     print_step(2, "Testing Dataset Structure")
     
-    dataset_path = "./dataset"
+    dataset_path = "/kaggle/input/penyisihan-hology-8-0-2025-data-mining"
     required_paths = [
         ("Dataset root", dataset_path),
         ("Training images", f"{dataset_path}/train/images"),
@@ -159,7 +159,7 @@ def test_preprocessing():
     
     if success:
         # Check output directory
-        output_dir = "./dataset/train/new_data"
+        output_dir = "/kaggle/working/train/new_data"
         if os.path.exists(output_dir):
             h5_files = [f for f in os.listdir(output_dir) if f.endswith('.h5')]
             print(f"  ✓ Generated {len(h5_files)} density map files")
