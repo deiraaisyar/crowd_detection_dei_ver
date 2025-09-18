@@ -171,7 +171,7 @@ def create_test_dataset(data_path):
 
 if __name__ == '__main__':
     # Test the dataset loader
-    data_path = './dataset'
+    data_path = '/kaggle/input/penyisihan-hology-8-0-2025-data-mining'
     
     print("Testing competition dataset loader...")
     
