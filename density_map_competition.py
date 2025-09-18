@@ -171,7 +171,7 @@ def visualize_sample_results(dataset_root, num_samples=3):
 
 if __name__ == '__main__':
     # Configuration
-    dataset_root = './dataset'  # Adjust path as needed
+    dataset_root = '.'  # Adjust path as needed
     
     print("Starting competition dataset preprocessing...")
     print("Converting JSON annotations to density maps...")
