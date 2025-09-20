@@ -8,7 +8,23 @@ from tensorboardX import SummaryWriter
 import os
 import argparse
 import time
+# Tambah SSIM
+import torch.nn.functional as F
 
+# SSIM function (simple version for single-channel)
+def ssim(img1, img2):
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    mu1 = F.avg_pool2d(img1, 3, 1, 1)
+    mu2 = F.avg_pool2d(img2, 3, 1, 1)
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = F.avg_pool2d(img1 * img1, 3, 1, 1) - mu1_sq
+    sigma2_sq = F.avg_pool2d(img2 * img2, 3, 1, 1) - mu2_sq
+    sigma12 = F.avg_pool2d(img1 * img2, 3, 1, 1) - mu1_mu2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bs', default=8, type=int, help='batch size')
@@ -101,34 +117,40 @@ def main():
             images = images.to(device)
             density = density.to(device)
             att = att.to(device)
-            
-            # Forward pass
+
+            # Normalisasi density dan output
+            density_norm = density / (density.max() + 1e-6)
             outputs, attention = model(images)
-            
-            # Calculate losses
-            loss_density = mseloss(outputs, density) / args.bs
-            loss_attention = bceloss(attention, att) / args.bs * 0.1  # Same weight as original
-            loss_total = loss_density + loss_attention
-            
+            outputs_norm = outputs / (outputs.max() + 1e-6)
+
+            # Loss density pakai normalized
+            loss_density = mseloss(outputs_norm, density_norm) / args.bs
+            loss_attention = bceloss(attention, att) / args.bs
+
+            # SSIM loss
+            ssim_loss = 1 - ssim(outputs_norm, density_norm)
+
+            # Total loss
+            loss_total = loss_density + 0.1 * loss_attention + 0.01 * ssim_loss
+
             # Backward pass
             optimizer.zero_grad()
             loss_total.backward()
             optimizer.step()
-            
+
             # Accumulate losses
             loss_avg += loss_density.item()
             loss_att_avg += loss_attention.item()
-            
+
             # Print progress
             if (i + 1) % 50 == 0:
                 avg_density_loss = loss_avg / (i + 1)
                 avg_att_loss = loss_att_avg / (i + 1)
                 pred_count = outputs.sum().item() / args.bs
                 true_count = density.sum().item() / args.bs
-                
                 print(f"Epoch {epoch:3d}, Step {i+1:4d}/{len(train_loader)}: "
                       f"Loss_D={avg_density_loss:.4f}, Loss_A={avg_att_loss:.4f}, "
-                      f"Pred={pred_count:.1f}, True={true_count:.1f}")
+                      f"Pred={pred_count:.1f}, True={true_count:.1f}, SSIM={ssim_loss.item():.4f}")
         
         # Calculate epoch averages
         epoch_loss_density = loss_avg / len(train_loader)

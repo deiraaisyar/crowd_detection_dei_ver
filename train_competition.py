@@ -8,6 +8,9 @@ from tensorboardX import SummaryWriter
 import os
 import argparse
 import time
+# Set random seed
+import random
+import numpy as np
 
 def main():
     parser = argparse.ArgumentParser()
@@ -22,11 +25,22 @@ def main():
     parser.add_argument('--val_freq', default=5, type=int, help='validation frequency (epochs)')
     
     args = parser.parse_args()
-    
+
+    # Set random seed for reproducibility
+    seed = 42
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     # Create directories if they don't exist
     os.makedirs(args.save_path, exist_ok=True)
     os.makedirs(args.log_path, exist_ok=True)
-    
+
     print("=== SFANet Competition Training ===")
     print(f"Dataset path: {args.data_path}")
     print(f"Batch size: {args.bs}")
